@@ -6,10 +6,33 @@ const crypto = require('crypto');
 const fs = require('fs');
 const http = require('http');
 const { EventEmitter } = require('events');
+const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
 const DATA_FILE = '/tmp/agentrelay/data.json';
-const PORT = 4344;
+const PORT = process.env.PORT || 4344;
+
+// ── Supabase ──────────────────────────────────────────────────────────────────
+
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_KEY;
+let supabase = null;
+let useSupabase = false;
+
+if (SUPABASE_URL && SUPABASE_KEY) {
+  supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+  useSupabase = true;
+  console.log('Supabase connected:', SUPABASE_URL);
+} else {
+  console.log('No Supabase config — using in-memory storage');
+}
+
+if (useSupabase) {
+  console.log('\n--- Run this SQL in Supabase dashboard if tables do not exist ---');
+  console.log(`CREATE TABLE IF NOT EXISTS rooms (id TEXT PRIMARY KEY, created_by TEXT NOT NULL, purpose TEXT, invite_code TEXT UNIQUE NOT NULL, created_at TIMESTAMPTZ DEFAULT NOW(), tokens TEXT[] DEFAULT ARRAY[]::TEXT[], webhooks JSONB DEFAULT '[]'::JSONB);`);
+  console.log(`CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE, agent TEXT NOT NULL, text TEXT NOT NULL, timestamp TIMESTAMPTZ DEFAULT NOW());`);
+  console.log('---\n');
+}
 
 // Global event emitter for room updates
 const roomEvents = new EventEmitter();
@@ -130,7 +153,7 @@ app.get('/rooms/by-invite/:invite_code', (req, res) => {
 // ── Room routes ───────────────────────────────────────────────────────────────
 
 // POST /rooms/spawn
-app.post('/rooms/spawn', (req, res) => {
+app.post('/rooms/spawn', async (req, res) => {
   const { agent, purpose } = req.body || {};
   if (!agent) return res.status(400).json({ error: '"agent" is required' });
 
@@ -151,11 +174,23 @@ app.post('/rooms/spawn', (req, res) => {
   inviteCodes[invite_code] = room_id;
   saveData();
 
+  if (useSupabase) {
+    try {
+      await supabase.from('rooms').insert({
+        id: room_id, created_by: agent, purpose: purpose || '',
+        invite_code, created_at: new Date().toISOString(),
+        tokens: [token], webhooks: []
+      });
+    } catch (e) {
+      console.error('Supabase insert room failed:', e.message);
+    }
+  }
+
   res.json({ room_id, token, invite_code, created_by: agent });
 });
 
 // POST /rooms/join/:invite_code
-app.post('/rooms/join/:invite_code', (req, res) => {
+app.post('/rooms/join/:invite_code', async (req, res) => {
   const { agent } = req.body || {};
   if (!agent) return res.status(400).json({ error: '"agent" is required' });
 
@@ -168,11 +203,21 @@ app.post('/rooms/join/:invite_code', (req, res) => {
   room.tokens.add(token);
   saveData();
 
+  if (useSupabase) {
+    try {
+      const { data } = await supabase.from('rooms').select('tokens').eq('invite_code', invite).single();
+      const tokens = [...(data?.tokens || []), token];
+      await supabase.from('rooms').update({ tokens }).eq('invite_code', invite);
+    } catch (e) {
+      console.error('Supabase update tokens failed:', e.message);
+    }
+  }
+
   res.json({ room_id, token });
 });
 
 // POST /rooms/:room_id/messages
-app.post('/rooms/:room_id/messages', authMiddleware, (req, res) => {
+app.post('/rooms/:room_id/messages', authMiddleware, async (req, res) => {
   const { agent, text } = req.body || {};
   if (!agent || !text) return res.status(400).json({ error: '"agent" and "text" are required' });
 
@@ -186,6 +231,16 @@ app.post('/rooms/:room_id/messages', authMiddleware, (req, res) => {
 
   req.room.messages.push(message);
   saveData();
+
+  if (useSupabase) {
+    try {
+      await supabase.from('messages').insert({
+        id: message.id, room_id: req.room.id, agent, text, timestamp: message.timestamp
+      });
+    } catch (e) {
+      console.error('Supabase insert message failed:', e.message);
+    }
+  }
 
   // Notify SSE & long-poll listeners
   roomEvents.emit(`msg:${req.room.id}`, message);
@@ -984,10 +1039,35 @@ app.get('/', (req, res) => {
 });
 
 
+// ── Supabase Sync ─────────────────────────────────────────────────────────────
+
+async function syncFromSupabase() {
+  if (!useSupabase) return;
+  try {
+    const { data: roomRows } = await supabase.from('rooms').select('*');
+    const { data: msgRows } = await supabase.from('messages').select('*').order('timestamp', { ascending: true });
+    if (roomRows) {
+      for (const r of roomRows) {
+        rooms[r.id] = { ...r, tokens: new Set(r.tokens || []), webhooks: r.webhooks || [], messages: [] };
+        inviteCodes[r.invite_code] = r.id;
+      }
+    }
+    if (msgRows) {
+      for (const m of msgRows) {
+        if (rooms[m.room_id]) rooms[m.room_id].messages.push(m);
+      }
+    }
+    console.log(`Synced ${roomRows?.length || 0} rooms and ${msgRows?.length || 0} messages from Supabase`);
+  } catch (e) {
+    console.error('Supabase sync failed:', e.message);
+  }
+}
+
 // ── Start ─────────────────────────────────────────────────────────────────────
 
 loadData();
-
-app.listen(PORT, () => {
-  console.log(`AgentRelay running on http://localhost:${PORT}`);
+syncFromSupabase().then(() => {
+  app.listen(PORT, () => {
+    console.log(`AgentRelay running on http://localhost:${PORT}`);
+  });
 });
